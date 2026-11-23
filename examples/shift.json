@@ -1,0 +1,37 @@
+{
+  "operations": [
+    {"op": "configure", "shift_id": "day", "revision": "r1", "calibrations": {
+      "vibration": {"raw_unit": "count", "unit": "mm/s", "scale": "1/2", "offset": "1/4", "minimum": -100, "maximum": 100},
+      "temperature": {"raw_unit": "count", "unit": "°C", "scale": "3/2", "offset": -2, "minimum": -100, "maximum": 100}
+    }},
+    {"op": "open_page", "page_id": "P41", "slot": "S1", "shift_id": "day", "revision": "r1", "beats": [41]},
+    {"op": "feed", "page_id": "P41", "kind": "reading", "beat": 41, "channel": "vibration", "raw": 7},
+    {"op": "collect", "page_id": "P41"},
+    {"op": "settle", "request_id": "v41", "page_id": "P41", "channel": "vibration"},
+    {"op": "settle", "request_id": "t41", "page_id": "P41", "channel": "temperature"},
+    {"op": "feed", "page_id": "P41", "kind": "reading", "beat": 41, "channel": "temperature", "raw": 11},
+    {"op": "feed", "page_id": "P41", "kind": "close"},
+    {"op": "release", "request_id": "clear41", "page_id": "P41"},
+    {"op": "collect", "page_id": "P41"},
+    {"op": "release", "request_id": "clear41", "page_id": "P41", "lose_reply": true},
+    {"op": "open_page", "page_id": "P42", "slot": "S1", "shift_id": "day", "revision": "r1", "beats": [42]},
+    {"op": "feed", "page_id": "P42", "kind": "reading", "beat": 42, "channel": "vibration", "raw": 0},
+    {"op": "feed", "page_id": "P42", "kind": "missing", "beat": 42, "channel": "temperature"},
+    {"op": "feed", "page_id": "P42", "kind": "close"},
+    {"op": "reopen", "online": true},
+    {"op": "release", "request_id": "clear41", "page_id": "P41"},
+    {"op": "page_status", "page_id": "P42"},
+    {"op": "collect", "page_id": "P42"},
+    {"op": "release", "request_id": "clear42", "page_id": "P42"},
+    {"op": "settle", "request_id": "t41", "page_id": "P41", "channel": "temperature", "fail_before_commit": true, "expect_publish_failure": true},
+    {"op": "reopen", "online": false},
+    {"op": "settle", "request_id": "t41", "page_id": "P41", "channel": "temperature"},
+    {"op": "settle", "request_id": "v42", "page_id": "P42", "channel": "vibration"},
+    {"op": "settle", "request_id": "t42", "page_id": "P42", "channel": "temperature"},
+    {"op": "lookup", "report_id": "report:v41"},
+    {"op": "lookup", "report_id": "report:t41"},
+    {"op": "origin", "report_id": "report:t41", "beat": 41},
+    {"op": "follow_up", "report_id": "report:t42"},
+    {"op": "summarize", "report_ids": ["report:v41", "report:t41", "report:v42", "report:t42"]}
+  ]
+}
