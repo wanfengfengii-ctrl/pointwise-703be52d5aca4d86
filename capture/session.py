@@ -8,14 +8,20 @@ from tempfile import TemporaryDirectory
 from capture.handoff import prepare_offer
 from capture.intake import collect
 from capture.release import release
+from capture.rolling import RollingStore, ingest as ingest_rolling, initialize_rolling_store
 from capture.store import CaptureStore, initialize_capture_store
 from desk.intake import SettlementRequest
 from desk.report import PublishInterrupted, settle
+from desk.rolling import (
+    RollingDeskStore, initialize_rolling_desk_store, settle_rolling as settle_rolling_desk,
+)
 from desk.store import DeskStore, initialize_desk_store
 from recorder import pages
+from recorder import rolling as rolling_device
 from recorder.store import DEFAULT_SLOTS, open_connection, open_device_store
 from review.missing import follow_up
 from review.reports import lookup
+from review.rolling import lookup_rolling as lookup_rolling_review
 from review.shift_summary import summarize_shift
 from rules.calibration import Calibration
 from rules.channels import require_channel, require_identifier
@@ -40,8 +46,12 @@ class StationSession:
             initialize_shift_store(self.connection)
             initialize_capture_store(self.connection)
             initialize_desk_store(self.connection)
+            initialize_rolling_store(self.connection)
+            initialize_rolling_desk_store(self.connection)
             self.capture = CaptureStore(self.connection)
             self.desk = DeskStore(self.connection)
+            self.rolling = RollingStore(self.connection)
+            self.rolling_desk = RollingDeskStore(self.connection)
             if online:
                 self.device = open_device_store(self.root / 'device.sqlite3', slots)
         except BaseException:
@@ -84,7 +94,22 @@ class StationSession:
     def page_status(self, page_id):
         return pages.page_status(self._require_device(), page_id)
 
+    def _is_normal_page(self, page_id):
+        if self.capture.load_evidence(page_id) is not None:
+            return True
+        if self.device is not None:
+            return rolling_device.page_kind(self.device, page_id) == 'normal'
+        return False
+
+    def _require_normal_flow(self, page_id):
+        require_identifier(page_id, 'page_id')
+        if self.rolling.has_page(page_id):
+            raise ValueError(f'page {page_id!r} belongs to the rolling flow')
+        if self.device is not None and rolling_device.page_kind(self.device, page_id) == 'rolling':
+            raise ValueError(f'page {page_id!r} belongs to the rolling flow')
+
     def collect(self, page_id):
+        self._require_normal_flow(page_id)
         return collect(self.capture, self.device, page_id)
 
     def settle(self, request_id, page_id, channel, *, fail_before_commit=False, before_commit=None):
@@ -94,6 +119,7 @@ class StationSession:
         previous = self.desk.load_intake(request_id)
         if previous is not None and (previous.request.page_id, previous.request.channel) != (page_id, channel):
             raise ValueError('settlement request was already bound to different parameters')
+        self._require_normal_flow(page_id)
         offer = prepare_offer(self.capture, page_id, channel)
         layout = offer.layout
         request = SettlementRequest(request_id, page_id, channel, layout.shift_id, layout.revision)
@@ -103,7 +129,36 @@ class StationSession:
         return settle(self.desk, request, offer, before_commit=checkpoint)
 
     def release(self, request_id, page_id, *, lose_reply=False):
+        self._require_normal_flow(page_id)
         return release(self.capture, self.device, request_id, page_id, lose_reply=lose_reply)
+
+    def open_rolling(self, page_id, slot, shift_id, revision, beats):
+        self.load_rule(shift_id, revision)
+        layout = pages.PageLayout(page_id, slot, shift_id, revision, beats)
+        return rolling_device.open_rolling(self._require_device(), layout)
+
+    def dispatch(self, ticket, page_id, beat, channel):
+        return rolling_device.dispatch(self._require_device(), ticket, page_id, beat, channel)
+
+    def ingest(self, event):
+        return ingest_rolling(self.rolling, event)
+
+    def settle_rolling(self, request_id, page_id, channel, *, fail_before_commit=False):
+        require_identifier(request_id, 'request_id')
+        require_identifier(page_id, 'page_id')
+        channel = require_channel(channel)
+        if not self.rolling.has_page(page_id):
+            if self._is_normal_page(page_id):
+                raise ValueError(f'page {page_id!r} is not part of the rolling flow')
+            if self.device is not None and rolling_device.is_rolling_page(self.device, page_id):
+                raise ValueError(f'rolling page {page_id!r} has no coverage evidence yet')
+        checkpoint = _interrupt_publish if fail_before_commit else None
+        return settle_rolling_desk(
+            self.rolling, self.rolling_desk, request_id, page_id, channel, before_commit=checkpoint,
+        )
+
+    def lookup_rolling(self, report_id):
+        return lookup_rolling_review(self.rolling_desk, report_id)
 
     def lookup(self, report_id):
         return lookup(self.desk, report_id)
@@ -124,6 +179,8 @@ def _perform(session, operation, arguments):
         'feed': session.feed, 'page_status': session.page_status, 'collect': session.collect,
         'settle': session.settle, 'release': session.release, 'lookup': session.lookup,
         'origin': session.origin, 'follow_up': session.follow_up, 'summarize': session.summarize,
+        'open_rolling': session.open_rolling, 'dispatch': session.dispatch, 'ingest': session.ingest,
+        'settle_rolling': session.settle_rolling, 'lookup_rolling': session.lookup_rolling,
     }
     if operation not in methods:
         raise ValueError(f'unknown station operation {operation!r}')
@@ -170,10 +227,55 @@ def _json_default(value):
     raise TypeError(f'unsupported scenario result {type(value).__name__}')
 
 
+def run_rolling_demo(root):
+    """Hand over a sealed rolling page's slot while its packets are still in flight."""
+    try:
+        from examples.rolling_link import DeliveryLink
+    except ImportError:  # allow running away from the repository root
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from examples.rolling_link import DeliveryLink
+    outcomes = []
+
+    def record(operation, result):
+        outcomes.append({'op': operation, 'result': result})
+
+    link = DeliveryLink()
+    with StationSession(root) as station:
+        record('configure', station.configure('day', 'r1', {
+            'vibration': Calibration('count', 'mm/s', '1/2', '1/4', -100, 100),
+            'temperature': Calibration('count', '°C', '3/2', -2, -100, 100),
+        }))
+        record('open_rolling', station.open_rolling('P', 'S1', 'day', 'r1', [41, 42]))
+        record('feed', station.feed('P', 'reading', beat=41, channel='vibration', raw=7))
+        record('feed', station.feed('P', 'reading', beat=42, channel='vibration', raw=9))
+        record('feed', station.feed('P', 'missing', beat=41, channel='temperature'))
+        record('feed', station.feed('P', 'missing', beat=42, channel='temperature'))
+        record('feed', station.feed('P', 'close'))
+        for ticket in ('T1', 'T2'):
+            packet = station.dispatch(ticket, 'P', 41, 'vibration')
+            link.hold(ticket, 'P', 41, 'vibration', packet)
+            record('dispatch', packet)
+        opened = station.open_rolling('Q', 'S1', 'day', 'r1', [41])
+        record('open_rolling', opened)
+        record('feed', station.feed('Q', 'reading', beat=41, channel='vibration', raw=99))
+        record('ingest', station.ingest(opened['cover']))
+        record('ingest', station.ingest(link.discard('T1')))
+        record('settle_rolling', station.settle_rolling('tP', 'P', 'temperature'))
+        record('settle_rolling', station.settle_rolling('vP', 'P', 'vibration'))
+        record('ingest', station.ingest(link.arrive('T2')))
+        record('settle_rolling', station.settle_rolling('vP', 'P', 'vibration'))
+    with StationSession(root, online=False) as station:
+        record('lookup_rolling', station.lookup_rolling('report:vP'))
+        record('lookup_rolling', station.lookup_rolling('report:tP'))
+    return outcomes
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Run the station recorder and shift desks.')
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('demo', help='run the deterministic station shift in a fresh directory')
+    commands.add_parser('rolling-demo', help='run the rolling slot handover in a fresh directory')
     run = commands.add_parser('run', help='apply a JSON operation list to a data directory')
     run.add_argument('data_dir', type=Path)
     run.add_argument('scenario', type=Path)
@@ -185,6 +287,9 @@ def main(argv=None):
             document = json.loads(scenario.read_text(encoding='utf-8'))
             with TemporaryDirectory(prefix='qingting-demo-') as directory:
                 outcomes = run_scenario(directory, document)
+        elif args.command == 'rolling-demo':
+            with TemporaryDirectory(prefix='qingting-rolling-demo-') as directory:
+                outcomes = run_rolling_demo(directory)
         else:
             document = json.loads(args.scenario.read_text(encoding='utf-8'))
             outcomes = run_scenario(args.data_dir, document, online=not args.offline)

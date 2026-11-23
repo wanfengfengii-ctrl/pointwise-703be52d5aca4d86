@@ -73,6 +73,25 @@ def initialize_device_store(store, slots=DEFAULT_SLOTS):
                 slot TEXT NOT NULL REFERENCES device_slots(slot)
             )
         ''')
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS device_rolling_pages (
+                page_id TEXT PRIMARY KEY REFERENCES device_pages(page_id)
+            )
+        ''')
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS device_dispatches (
+                ticket TEXT PRIMARY KEY,
+                page_id TEXT NOT NULL REFERENCES device_pages(page_id),
+                beat INTEGER NOT NULL,
+                channel TEXT NOT NULL CHECK (channel IN ('vibration', 'temperature'))
+            )
+        ''')
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS device_covers (
+                page_id TEXT PRIMARY KEY REFERENCES device_pages(page_id),
+                notification TEXT NOT NULL
+            )
+        ''')
         if db.execute('SELECT 1 FROM device_slots LIMIT 1').fetchone() is None:
             names = tuple(require_identifier(slot, 'slot') for slot in slots)
             if not names or len(set(names)) != len(names):

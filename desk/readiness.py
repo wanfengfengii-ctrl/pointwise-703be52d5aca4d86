@@ -10,6 +10,7 @@ class BeatStatus(StrEnum):
     WAITING = 'waiting'
     READING = 'reading'
     MISSING = 'missing'
+    TRANSPORT_LOST = 'transport_lost'
 
 
 @dataclass(frozen=True)
